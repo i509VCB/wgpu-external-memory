@@ -1,5 +1,5 @@
-use wgpu::{DeviceDescriptor, DeviceType, Instance};
-use wgpu_external_memory::{vulkan::VulkanInstanceExt, AdapterExt, ExternalMemoryCapabilities};
+use wgpu::{DeviceDescriptor, Instance};
+use wgpu_external_memory::{vulkan::VulkanInstanceExt, AdapterExt, ExternalMemoryType};
 use wgpu_hal::api::Vulkan;
 
 fn main() {
@@ -19,24 +19,28 @@ fn run() {
 
     dbg!(instance_extensions);
 
-    let adapter = instance
+    let adapters = instance
         .enumerate_adapters(wgpu::Backends::VULKAN)
-        .filter(|adapter| unsafe { adapter.as_hal::<Vulkan, _, _>(|adapter| adapter.is_some()) })
-        .filter(|adapter| adapter.get_info().device_type == DeviceType::DiscreteGpu)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .next()
-        .expect("No device?");
+        // Filter out adapters that don't support external memory
+        .filter(|adapter| {
+            let supported = adapter.supports_memory_type(ExternalMemoryType::Dmabuf);
+
+            if !supported {
+                println!("{:?} does not support external memory", adapter.get_info());
+            } else {
+                println!("{:?} supports external memory", adapter.get_info());
+            }
+
+            supported
+        });
+
+    let adapter = adapters.into_iter().next().expect("no adapter?");
 
     let (device, _queue) = adapter
-        .request_device_with_external_memory(
-            DeviceDescriptor::default(),
-            ExternalMemoryCapabilities::empty(),
-            None,
-        )
+        .request_device_with_external_memory(DeviceDescriptor::default(), None)
         .expect("Create device");
 
-    let limits = device.as_ref().limits();
+    let _limits = device.as_ref().limits();
     unsafe {
         device.as_ref().as_hal::<Vulkan, _, _>(|device| {
             let device = device.unwrap();

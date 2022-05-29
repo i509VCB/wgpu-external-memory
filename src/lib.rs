@@ -17,7 +17,11 @@ use imp::DeviceInner;
 use wgpu::{DeviceDescriptor, RequestDeviceError};
 
 #[derive(Debug)]
-pub enum ExternalMemoryType {}
+pub enum ExternalMemoryType {
+    /// Linux Dmabuf handle.
+    Dmabuf,
+    // TODO: Other handle types
+}
 
 bitflags! {
     /// Describes what operations may be performed on external memory.
@@ -53,20 +57,13 @@ pub trait AdapterExt: Sized {
     fn request_device_with_external_memory(
         &self,
         desc: DeviceDescriptor,
-        capabilities: ExternalMemoryCapabilities,
         trace_path: Option<&Path>,
     ) -> Result<(ExternalMemoryDevice, wgpu::Queue), RequestDeviceError>;
 
     /// Queries whether the specified type of external memory is supported.
     ///
-    /// This can be used to filter out adapters which may not support the memory handles you expect are supported.
-    ///
-    /// This does not guarantee specific texture formats are supported when importing memory that is used as
-    /// a texture.
-    fn external_memory_capabilities(
-        &self,
-        external_memory_type: ExternalMemoryType,
-    ) -> ExternalMemoryCapabilities;
+    /// This can be used to filter out adapters which may not support the memory handles you require.
+    fn supports_memory_type(&self, external_memory_type: ExternalMemoryType) -> bool;
 }
 
 /// A device capable of importing and exporting external memory objects.

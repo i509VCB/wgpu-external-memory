@@ -1,16 +1,11 @@
 pub mod vulkan;
 
-use std::{ffi::CStr, path::Path};
+use std::path::Path;
 
-use ash::extensions::khr::ExternalMemoryFd;
 use wgpu::{Adapter, DeviceDescriptor, RequestDeviceError};
 use wgpu_hal::{api::Vulkan, InstanceDescriptor, InstanceFlags};
 
-use crate::{
-    imp::vulkan::{ash_update::ImageDrmFormatModifier, VulkanAdapterExt},
-    AdapterExt, ExternalMemoryCapabilities, ExternalMemoryDevice, ExternalMemoryType,
-    InstanceError,
-};
+use crate::{AdapterExt, ExternalMemoryDevice, ExternalMemoryType, InstanceError};
 
 #[derive(Debug)]
 pub enum DeviceInner {
@@ -21,7 +16,6 @@ impl AdapterExt for Adapter {
     fn request_device_with_external_memory(
         &self,
         desc: DeviceDescriptor,
-        capabilities: ExternalMemoryCapabilities,
         trace_path: Option<&Path>,
     ) -> Result<(ExternalMemoryDevice, wgpu::Queue), RequestDeviceError> {
         #[cfg(vulkan)]
@@ -36,20 +30,17 @@ impl AdapterExt for Adapter {
         Err(RequestDeviceError)
     }
 
-    fn external_memory_capabilities(
-        &self,
-        external_memory_type: ExternalMemoryType,
-    ) -> ExternalMemoryCapabilities {
+    fn supports_memory_type(&self, external_memory_type: ExternalMemoryType) -> bool {
         #[cfg(vulkan)]
         {
             let is_vulkan = unsafe { self.as_hal::<Vulkan, _, bool>(|adapter| adapter.is_some()) };
 
             if is_vulkan {
-                return vulkan::external_memory_capabilities(self, external_memory_type);
+                return vulkan::supports_memory_type(self, external_memory_type);
             }
         }
 
-        ExternalMemoryCapabilities::empty()
+        false
     }
 }
 

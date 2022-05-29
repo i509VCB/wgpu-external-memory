@@ -320,27 +320,15 @@ impl VulkanAdapterExt for <Vulkan as Api>::Adapter {
             Err(_) => return false,
         };
 
-        // Check that the required extensions are available.
-        if !REQUIRED_DEVICE_EXTENSIONS
-            .iter()
-            .all(|name| device_extensions.iter().any(|c| &c.as_ref() == name))
-        {
-            return false;
-        }
-
-        // Check that the handle specific required extensions are available.
         let type_extensions = match external_memory_type {
             ExternalMemoryType::Dmabuf => dmabuf::REQUIRED_DEVICE_EXTENSIONS,
         };
 
-        if !type_extensions
+        // Check that the required extensions are available.
+        REQUIRED_DEVICE_EXTENSIONS
             .iter()
+            .chain(type_extensions)
             .all(|name| device_extensions.iter().any(|c| &c.as_ref() == name))
-        {
-            return false;
-        }
-
-        true
     }
 }
 

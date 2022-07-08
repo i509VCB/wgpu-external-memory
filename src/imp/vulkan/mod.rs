@@ -1,106 +1,55 @@
 mod dmabuf;
 
 use std::{
+    collections::HashMap,
     ffi::{CStr, CString},
     fmt,
     path::Path,
 };
 
 use ash::{
-    extensions::khr::ExternalMemoryFd,
+    extensions::khr::{ExternalMemoryFd, GetPhysicalDeviceProperties2},
     vk::{self, KhrExternalMemoryFn},
 };
+use drm_fourcc::{DrmFormat, DrmFourcc, DrmModifier};
 use wgpu::{Adapter, DeviceDescriptor, Features, Limits, RequestDeviceError};
 use wgpu_hal::{
     api::Vulkan, Api, DeviceError, InstanceDescriptor, InstanceError, InstanceFlags, OpenDevice,
     UpdateAfterBindTypes,
 };
 
-use crate::{vulkan::VulkanInstanceExt, ExternalMemoryDevice, ExternalMemoryType};
+use crate::{
+    adapter::{DeviceUuids, DrmInfo},
+    ExternalMemoryDevice,
+};
 
 use self::ash_upstreamed::ImageDrmFormatModifier;
 
-use super::{instance_desc, DeviceInner};
+use super::DeviceInner;
 
-impl VulkanInstanceExt for wgpu::Instance {
-    fn vulkan_with_external_memory() -> Result<wgpu::Instance, crate::InstanceError> {
-        unsafe {
-            let hal_instance = with_external_memory(&instance_desc())?;
-            Ok(wgpu::Instance::from_hal::<Vulkan>(hal_instance))
-        }
-    }
-}
-
-pub fn request_device(
-    adapter: &Adapter,
-    desc: DeviceDescriptor,
-    trace_path: Option<&Path>,
-) -> Result<(ExternalMemoryDevice, wgpu::Queue), RequestDeviceError> {
-    let hal_device = unsafe {
-        adapter.as_hal::<Vulkan, _, _>(|adapter| {
-            let adapter = adapter.unwrap();
-            adapter.open_with_external_memory(desc.features, &desc.limits)
-        })
-    }
-    .map_err(|_| RequestDeviceError)?;
-
-    let (device, queue) = unsafe { adapter.create_device_from_hal(hal_device, &desc, trace_path) }?;
-
-    let inner = unsafe {
-        device.as_hal::<Vulkan, _, _>(|device| {
-            let device = device.unwrap();
-            let raw_device = device.raw_device();
-
-            let raw_instance = device.raw_instance();
-            let external_memory_fd = ExternalMemoryFd::new(raw_instance, raw_device);
-            let image_drm_format_modifier = ImageDrmFormatModifier::new(raw_instance, raw_device);
-
-            DeviceInner::Vulkan(Inner {
-                external_memory_fd,
-                image_drm_format_modifier,
-            })
-        })
-    };
-
-    let device = ExternalMemoryDevice { device, inner };
-
-    Ok((device, queue))
-}
-
-pub fn supports_memory_type(adapter: &Adapter, external_memory_type: ExternalMemoryType) -> bool {
-    unsafe {
-        adapter.as_hal::<Vulkan, _, _>(|adapter| {
-            adapter.unwrap().supports_memory_type(external_memory_type)
-        })
-    }
-}
-
-/// Instance extensions required to use external memory.
-const REQUIRED_INSTANCE_EXTENSIONS: &[&CStr] = &[
-    // dependency of VK_KHR_external_memory
+pub fn try_create_instance(desc: InstanceDescriptor<'static>) -> Option<<Vulkan as Api>::Instance> {
+    // Creating a Vulkan instance for wgpu is more complicated than EGL. Vulkan requires all extensions to be
+    // explicitly enabled at creation time and specific extensions may require enabling specific Vulkan
+    // features.
     //
-    // This is required or 1.1
-    vk::KhrExternalMemoryCapabilitiesFn::name(),
-    // WGPU requires VK_KHR_physical_device_properties2
-    //
-    // Listed for completeness
-    vk::KhrGetPhysicalDeviceProperties2Fn::name(),
-];
+    // Much of the code here is copied from wgpu_hal::vulkan::Instance::init
 
-/// Device extensions required to use all external memory handles.
-const REQUIRED_DEVICE_EXTENSIONS: &[&CStr] = &[
-    KhrExternalMemoryFn::name(), // Or 1.1
-];
+    const REQUIRED_INSTANCE_EXTENSIONS: &[&CStr] = &[
+        // dependency of VK_KHR_external_memory
+        //
+        // This is required or Vulkan 1.1
+        vk::KhrExternalMemoryCapabilitiesFn::name(),
+        // WGPU requires VK_KHR_physical_device_properties2
+        //
+        // Listed for completeness
+        vk::KhrGetPhysicalDeviceProperties2Fn::name(),
+    ];
 
-// Copied from wgpu_hal::vulkan::Instance::init
-unsafe fn with_external_memory(
-    desc: &InstanceDescriptor,
-) -> Result<<Vulkan as Api>::Instance, InstanceError> {
-    let entry = match ash::Entry::load() {
+    let entry = match unsafe { ash::Entry::load() } {
         Ok(entry) => entry,
         Err(err) => {
             log::info!("Missing Vulkan entry points: {:?}", err);
-            return Err(InstanceError);
+            return None;
         }
     };
     let driver_api_version = match entry.try_enumerate_instance_version() {
@@ -109,7 +58,7 @@ unsafe fn with_external_memory(
         Ok(None) => vk::API_VERSION_1_0,
         Err(err) => {
             log::warn!("try_enumerate_instance_version: {:?}", err);
-            return Err(InstanceError);
+            return None;
         }
     };
 
@@ -136,19 +85,21 @@ unsafe fn with_external_memory(
             },
         );
 
-    let mut extensions = <Vulkan as Api>::Instance::required_extensions(&entry, desc.flags)?;
-
+    let mut extensions = <Vulkan as Api>::Instance::required_extensions(&entry, desc.flags).ok()?;
     extensions.extend(REQUIRED_INSTANCE_EXTENSIONS);
 
-    let instance_layers = entry.enumerate_instance_layer_properties().map_err(|e| {
-        log::info!("enumerate_instance_layer_properties: {:?}", e);
-        InstanceError
-    })?;
+    let instance_layers = entry
+        .enumerate_instance_layer_properties()
+        .map_err(|e| {
+            log::info!("enumerate_instance_layer_properties: {:?}", e);
+            InstanceError
+        })
+        .ok()?;
 
     let nv_optimus_layer = CStr::from_bytes_with_nul(b"VK_LAYER_NV_optimus\0").unwrap();
-    let has_nv_optimus = instance_layers
-        .iter()
-        .any(|inst_layer| CStr::from_ptr(inst_layer.layer_name.as_ptr()) == nv_optimus_layer);
+    let has_nv_optimus = instance_layers.iter().any(
+        |inst_layer| unsafe { CStr::from_ptr(inst_layer.layer_name.as_ptr()) } == nv_optimus_layer,
+    );
 
     // Check requested layers against the available layers
     let layers = {
@@ -159,10 +110,9 @@ unsafe fn with_external_memory(
 
         // Only keep available layers.
         layers.retain(|&layer| {
-            if instance_layers
-                .iter()
-                .any(|inst_layer| CStr::from_ptr(inst_layer.layer_name.as_ptr()) == layer)
-            {
+            if instance_layers.iter().any(
+                |inst_layer| unsafe { CStr::from_ptr(inst_layer.layer_name.as_ptr()) } == layer,
+            ) {
                 true
             } else {
                 log::warn!("Unable to find layer: {}", layer.to_string_lossy());
@@ -188,22 +138,160 @@ unsafe fn with_external_memory(
             .enabled_layer_names(&str_pointers[..layers.len()])
             .enabled_extension_names(&str_pointers[layers.len()..]);
 
-        entry.create_instance(&create_info, None).map_err(|e| {
-            log::warn!("create_instance: {:?}", e);
-            InstanceError
-        })?
+        unsafe {
+            entry.create_instance(&create_info, None).map_err(|e| {
+                log::warn!("create_instance: {:?}", e);
+                InstanceError
+            })
+        }
+        .ok()?
     };
 
-    <Vulkan as Api>::Instance::from_raw(
-        entry,
-        vk_instance,
-        driver_api_version,
-        extensions,
-        desc.flags,
-        has_nv_optimus,
-        Some(Box::new(())), // `Some` signals that wgpu-hal is in charge of destroying vk_instance
-    )
+    unsafe {
+        <Vulkan as Api>::Instance::from_raw(
+            entry,
+            vk_instance,
+            driver_api_version,
+            0, // Android SDK
+            extensions,
+            desc.flags,
+            has_nv_optimus,
+            Some(Box::new(())), // `Some` signals that wgpu-hal is in charge of destroying vk_instance
+        )
+    }
+    .ok()
 }
+
+pub fn get_device_uuids(_adapter: Option<&<Vulkan as Api>::Adapter>) -> Option<DeviceUuids> {
+    None // TODO
+}
+
+pub fn get_drm_info(adapter: Option<&<Vulkan as Api>::Adapter>) -> Option<DrmInfo> {
+    let adapter = adapter.unwrap();
+    let info = get_adapter_drm_info(adapter)?;
+
+    let mut uuids = DrmInfo {
+        primary_node: None,
+        render_node: None,
+    };
+
+    if info.has_primary == vk::TRUE {
+        uuids.primary_node = Some((info.primary_major as _, info.primary_minor as _));
+    }
+
+    if info.has_render == vk::TRUE {
+        uuids.render_node = Some((info.render_major as _, info.render_minor as _));
+    }
+
+    Some(uuids)
+}
+
+fn get_adapter_drm_info(
+    adapter: &<Vulkan as Api>::Adapter,
+) -> Option<vk::PhysicalDeviceDrmPropertiesEXT> {
+    let phd = adapter.raw_physical_device();
+
+    if let Ok(extensions) = unsafe {
+        adapter
+            .shared_instance()
+            .raw_instance()
+            .enumerate_device_extension_properties(phd)
+    } {
+        if extensions.iter().any(|properties| {
+            let name = unsafe { CStr::from_ptr(&properties.extension_name as *const _) };
+            name == vk::ExtPhysicalDeviceDrmFn::name()
+        }) {
+            let shared = adapter.shared_instance();
+
+            let mut physical_device_drm = vk::PhysicalDeviceDrmPropertiesEXT::builder();
+            let mut properties =
+                vk::PhysicalDeviceProperties2::builder().push_next(&mut physical_device_drm);
+
+            // wgpu requires VK_KHR_get_physical_device_properties2, no need to check for the extension.
+            unsafe {
+                get_physical_device_properties2(
+                    shared.entry(),
+                    shared.raw_instance(),
+                    phd,
+                    &mut properties,
+                    shared.driver_api_version(),
+                )
+            };
+
+            return Some(physical_device_drm.build());
+        }
+    }
+
+    // Device was lost or required extensions are not available.
+    None
+}
+
+unsafe fn get_physical_device_properties2(
+    entry: &ash::Entry,
+    instance: &ash::Instance,
+    phd: vk::PhysicalDevice,
+    properties: &mut vk::PhysicalDeviceProperties2,
+    version: u32,
+) {
+    if version > vk::API_VERSION_1_0 {
+        instance.get_physical_device_properties2(phd, properties)
+    } else {
+        // Load the extension function
+        let fns = GetPhysicalDeviceProperties2::new(entry, instance);
+        fns.get_physical_device_properties2(phd, properties)
+    }
+}
+
+pub fn request_device(
+    adapter: &Adapter,
+    desc: DeviceDescriptor,
+    trace_path: Option<&Path>,
+) -> Result<(ExternalMemoryDevice, wgpu::Queue), RequestDeviceError> {
+    let hal_device = unsafe {
+        adapter.as_hal::<Vulkan, _, _>(|adapter| {
+            let adapter = adapter.unwrap();
+            adapter.open_with_external_memory(desc.features, &desc.limits)
+        })
+    }
+    .map_err(|_| RequestDeviceError)?;
+
+    let (device, queue) = unsafe { adapter.create_device_from_hal(hal_device, &desc, trace_path) }?;
+
+    let inner = unsafe {
+        device.as_hal::<Vulkan, _, _>(|device| {
+            let device = device.unwrap();
+            let raw_device = device.raw_device();
+            let raw_instance = device.shared_instance().raw_instance();
+
+            DeviceInner::Vulkan(Inner::new(
+                raw_instance,
+                device.raw_physical_device(),
+                raw_device,
+            ))
+        })
+    };
+
+    let device = ExternalMemoryDevice { device, inner };
+
+    Ok((device, queue))
+}
+
+/// Instance extensions required to use external memory.
+const REQUIRED_INSTANCE_EXTENSIONS: &[&CStr] = &[
+    // dependency of VK_KHR_external_memory
+    //
+    // This is required or 1.1
+    vk::KhrExternalMemoryCapabilitiesFn::name(),
+    // WGPU requires VK_KHR_physical_device_properties2
+    //
+    // Listed for completeness
+    vk::KhrGetPhysicalDeviceProperties2Fn::name(),
+];
+
+/// Device extensions required to use all external memory handles.
+const REQUIRED_DEVICE_EXTENSIONS: &[&CStr] = &[
+    KhrExternalMemoryFn::name(), // Or 1.1
+];
 
 pub trait VulkanAdapterExt: Sized {
     unsafe fn open_with_external_memory(
@@ -211,8 +299,6 @@ pub trait VulkanAdapterExt: Sized {
         features: Features,
         limits: &Limits,
     ) -> Result<OpenDevice<Vulkan>, DeviceError>;
-
-    fn supports_memory_type(&self, external_memory_type: ExternalMemoryType) -> bool;
 }
 
 impl VulkanAdapterExt for <Vulkan as Api>::Adapter {
@@ -226,7 +312,7 @@ impl VulkanAdapterExt for <Vulkan as Api>::Adapter {
         let mut enabled_extensions = self.required_device_extensions(features);
 
         // Test that all required instance extensions are available
-        let instance_extensions = self.enabled_instance_extensions();
+        let instance_extensions = self.shared_instance().extensions();
         let iter = REQUIRED_INSTANCE_EXTENSIONS
             .iter()
             .filter(|&&req_extension| {
@@ -248,9 +334,7 @@ impl VulkanAdapterExt for <Vulkan as Api>::Adapter {
         enabled_extensions.extend(REQUIRED_DEVICE_EXTENSIONS);
 
         // TODO: All handle types
-        if self.supports_memory_type(ExternalMemoryType::Dmabuf) {
-            enabled_extensions.extend(dmabuf::REQUIRED_DEVICE_EXTENSIONS);
-        }
+        // TODO: Enable dmabuf device extensions
 
         let mut enabled_phd_features =
             self.physical_device_features(&enabled_extensions, features, uab_types);
@@ -278,8 +362,11 @@ impl VulkanAdapterExt for <Vulkan as Api>::Adapter {
             .build();
         let raw_device = {
             // profiling::scope!("vkCreateDevice");
-            self.raw_instance()
-                .create_device(self.raw_physical_device(), &info, None)?
+            self.shared_instance().raw_instance().create_device(
+                self.raw_physical_device(),
+                &info,
+                None,
+            )?
         };
 
         self.device_from_raw(
@@ -292,55 +379,86 @@ impl VulkanAdapterExt for <Vulkan as Api>::Adapter {
             0,
         )
     }
-
-    fn supports_memory_type(&self, external_memory_type: ExternalMemoryType) -> bool {
-        // Test if required instance extensions are supported.
-        let instance_extensions = self.enabled_instance_extensions();
-        if instance_extensions.iter().all(|&extension_name| {
-            REQUIRED_INSTANCE_EXTENSIONS
-                .iter()
-                .any(|&name| extension_name == name)
-        }) {
-            return false;
-        }
-
-        let device_extensions = unsafe {
-            self.raw_instance()
-                .enumerate_device_extension_properties(self.raw_physical_device())
-        };
-
-        let device_extensions = match device_extensions {
-            Ok(extensions) => extensions
-                .into_iter()
-                .map(|properties| {
-                    unsafe { CStr::from_ptr(&properties.extension_name as *const _) }.to_owned()
-                })
-                .collect::<Vec<_>>(),
-
-            Err(_) => return false,
-        };
-
-        let type_extensions = match external_memory_type {
-            ExternalMemoryType::Dmabuf => dmabuf::REQUIRED_DEVICE_EXTENSIONS,
-        };
-
-        // Check that the required extensions are available.
-        REQUIRED_DEVICE_EXTENSIONS
-            .iter()
-            .chain(type_extensions)
-            .all(|name| device_extensions.iter().any(|c| &c.as_ref() == name))
-    }
 }
 
 pub struct Inner {
     pub external_memory_fd: ExternalMemoryFd,
     pub image_drm_format_modifier: ImageDrmFormatModifier,
+    pub supported_drm_formats: HashMap<DrmFormat, vk::DrmFormatModifierPropertiesEXT>,
+}
+
+impl Inner {
+    pub fn new(instance: &ash::Instance, phd: vk::PhysicalDevice, device: &ash::Device) -> Self {
+        let external_memory_fd = ExternalMemoryFd::new(instance, device);
+        let image_drm_format_modifier = ImageDrmFormatModifier::new(instance, device);
+
+        let mut supported_drm_formats = HashMap::new();
+
+        // TODO: More formats
+        {
+            let modifier_properties =
+                unsafe { get_drm_format_properties_list(instance, phd, vk::Format::B8G8R8A8_SRGB) };
+
+            for properties in modifier_properties {
+                let drm_format = DrmFormat {
+                    code: DrmFourcc::Argb8888,
+                    modifier: DrmModifier::from(properties.drm_format_modifier),
+                };
+
+                supported_drm_formats.insert(drm_format, properties);
+
+                let drm_format = DrmFormat {
+                    code: DrmFourcc::Xrgb8888,
+                    modifier: DrmModifier::from(properties.drm_format_modifier),
+                };
+
+                supported_drm_formats.insert(drm_format, properties);
+            }
+        }
+
+        Self {
+            external_memory_fd,
+            image_drm_format_modifier,
+            supported_drm_formats,
+        }
+    }
 }
 
 impl fmt::Debug for Inner {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("DeviceInner").finish_non_exhaustive()
+        f.debug_struct("Inner")
+            .field("supported_drm_formats", &self.supported_drm_formats)
+            .finish()
     }
+}
+
+pub unsafe fn get_drm_format_properties_list(
+    instance: &ash::Instance,
+    pdevice: vk::PhysicalDevice,
+    format: vk::Format,
+) -> Vec<vk::DrmFormatModifierPropertiesEXT> {
+    let mut list = vk::DrmFormatModifierPropertiesListEXT::default();
+
+    // Need to get number of entries in list and then allocate the vector as needed.
+    {
+        let mut format_properties_2 = vk::FormatProperties2::builder().push_next(&mut list);
+
+        instance.get_physical_device_format_properties2(pdevice, format, &mut format_properties_2);
+    }
+
+    let mut data = Vec::with_capacity(list.drm_format_modifier_count as usize);
+
+    // Read the number of elements into the vector.
+    list.p_drm_format_modifier_properties = data.as_mut_ptr();
+
+    {
+        let mut format_properties_2 = vk::FormatProperties2::builder().push_next(&mut list);
+
+        instance.get_physical_device_format_properties2(pdevice, format, &mut format_properties_2);
+    }
+
+    data.set_len(list.drm_format_modifier_count as usize);
+    data
 }
 
 /// This module contains code that has been upstreamed to ash, pending a new ash release and a wgpu update to

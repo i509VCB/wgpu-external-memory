@@ -1,1 +1,1 @@
-Experiments to allow importing and exporting external memory in wgpu.
+wgpu extensions for the DRM (Direct Rendering Manager) subsystem.

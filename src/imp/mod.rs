@@ -1,11 +1,15 @@
+pub mod egl;
 pub mod vulkan;
 
 use std::path::Path;
 
 use wgpu::{Adapter, DeviceDescriptor, RequestDeviceError};
-use wgpu_hal::{api::Vulkan, InstanceDescriptor, InstanceFlags};
+use wgpu_hal::{api::Gles, api::Vulkan};
 
-use crate::{AdapterExt, ExternalMemoryDevice, ExternalMemoryType, InstanceError};
+use crate::{
+    adapter::{AdapterExt, DeviceUuids, DrmInfo},
+    ExternalMemoryDevice,
+};
 
 #[derive(Debug)]
 pub enum DeviceInner {
@@ -13,6 +17,54 @@ pub enum DeviceInner {
 }
 
 impl AdapterExt for Adapter {
+    fn uuids(&self) -> Option<DeviceUuids> {
+        #[cfg(vulkan)]
+        {
+            let is_vulkan = unsafe { self.as_hal::<Vulkan, _, bool>(|adapter| adapter.is_some()) };
+
+            if is_vulkan {
+                return unsafe { self.as_hal::<Vulkan, _, _>(vulkan::get_device_uuids) };
+            }
+        }
+
+        #[cfg(egl)]
+        {
+            let is_gl = unsafe { self.as_hal::<Gles, _, bool>(|adapter| adapter.is_some()) };
+
+            if is_gl {
+                return unsafe { self.as_hal::<Gles, _, _>(egl::get_device_uuids) };
+            }
+        }
+
+        None
+    }
+
+    fn drm_info(&self) -> Option<DrmInfo> {
+        #[cfg(vulkan)]
+        {
+            let is_vulkan = unsafe { self.as_hal::<Vulkan, _, bool>(|adapter| adapter.is_some()) };
+
+            if is_vulkan {
+                return unsafe { self.as_hal::<Vulkan, _, _>(vulkan::get_drm_info) };
+            }
+        }
+
+        #[cfg(egl)]
+        {
+            let is_gl = unsafe { self.as_hal::<Gles, _, bool>(|adapter| adapter.is_some()) };
+
+            if is_gl {
+                return unsafe { self.as_hal::<Gles, _, _>(egl::get_drm_info) };
+            }
+        }
+
+        None
+    }
+
+    fn supports_dmabuf_external_memory(&self) -> bool {
+        false // TODO
+    }
+
     fn request_device_with_external_memory(
         &self,
         desc: DeviceDescriptor,
@@ -27,37 +79,8 @@ impl AdapterExt for Adapter {
             }
         }
 
+        // TODO: EGL
+
         Err(RequestDeviceError)
-    }
-
-    fn supports_memory_type(&self, external_memory_type: ExternalMemoryType) -> bool {
-        #[cfg(vulkan)]
-        {
-            let is_vulkan = unsafe { self.as_hal::<Vulkan, _, bool>(|adapter| adapter.is_some()) };
-
-            if is_vulkan {
-                return vulkan::supports_memory_type(self, external_memory_type);
-            }
-        }
-
-        false
-    }
-}
-
-impl From<wgpu_hal::InstanceError> for InstanceError {
-    fn from(_: wgpu_hal::InstanceError) -> Self {
-        Self
-    }
-}
-
-fn instance_desc() -> InstanceDescriptor<'static> {
-    let mut flags = InstanceFlags::empty();
-    if cfg!(debug_assertions) {
-        flags |= InstanceFlags::VALIDATION;
-        flags |= InstanceFlags::DEBUG;
-    }
-    InstanceDescriptor {
-        name: "wgpu-external-memory",
-        flags,
     }
 }

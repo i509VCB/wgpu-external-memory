@@ -1,8 +1,4 @@
-use std::{
-    ffi::c_void,
-    mem::{self, MaybeUninit},
-    os::raw::c_uint,
-};
+use std::{ffi::c_void, mem, os::raw::c_uint};
 
 use wgpu_core::api::Gles;
 use wgpu_hal::{Api, InstanceDescriptor};
@@ -83,6 +79,7 @@ fn get_egl_extensions(adapter: &<Gles as Api>::Adapter) -> Option<Vec<String>> {
     )
 }
 
+#[allow(dead_code)]
 fn get_display_extensions(adapter: &<Gles as Api>::Adapter) -> Option<Vec<String>> {
     let instance = adapter.adapter_context().egl_instance()?;
     let display = *adapter.adapter_context().raw_display()?;

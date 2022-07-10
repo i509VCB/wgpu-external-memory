@@ -1,3 +1,8 @@
+// TODO:
+// - wgpu needs to have a way to insert custom barriers.
+//   This is because imported images belong to a foreign or external queue family.
+//   This means we need queue family ownership transfer on acquire and release to access the image resources.
+
 mod dmabuf;
 
 use std::{
@@ -162,8 +167,51 @@ pub fn try_create_instance(desc: InstanceDescriptor<'static>) -> Option<<Vulkan 
     .ok()
 }
 
-pub fn get_device_uuids(_adapter: Option<&<Vulkan as Api>::Adapter>) -> Option<DeviceUuids> {
-    None // TODO
+pub fn get_device_uuids(adapter: Option<&<Vulkan as Api>::Adapter>) -> Option<DeviceUuids> {
+    let adapter = adapter.unwrap();
+    let instance = adapter.shared_instance();
+
+    let supports_device_id_properties = {
+        // In Vulkan 1.0, one of the following instance must be enabled:
+        // - VK_KHR_external_fence_capabilities
+        // - VK_KHR_external_memory_capabilities
+        // - VK_KHR_external_semaphore_capabilities
+        const INSTANCE_EXTENSIONS: &[&CStr] = &[
+            vk::KhrExternalFenceCapabilitiesFn::name(),
+            vk::KhrExternalMemoryCapabilitiesFn::name(),
+            vk::KhrExternalSemaphoreCapabilitiesFn::name(),
+        ];
+
+        // In Vulkan 1.1, VkPhysicalDeviceIDProperties is always available.
+        instance.driver_api_version() != vk::API_VERSION_1_0
+            || INSTANCE_EXTENSIONS
+                .iter()
+                .any(|name| instance.extensions().contains(name))
+    };
+
+    if !supports_device_id_properties {
+        return None;
+    }
+
+    let mut device_id_properties = vk::PhysicalDeviceIDProperties::builder();
+    let mut properties =
+        vk::PhysicalDeviceProperties2::builder().push_next(&mut device_id_properties);
+
+    // SAFETY: The instance uses Vulkan 1.1 or one of the required extensions is supported.
+    unsafe {
+        get_physical_device_properties2(
+            instance.entry(),
+            instance.raw_instance(),
+            adapter.raw_physical_device(),
+            &mut properties,
+            instance.driver_api_version(),
+        );
+    }
+
+    Some(DeviceUuids {
+        driver_uuid: device_id_properties.driver_uuid,
+        device_uuid: device_id_properties.device_uuid,
+    })
 }
 
 pub fn get_drm_info(adapter: Option<&<Vulkan as Api>::Adapter>) -> Option<DrmInfo> {

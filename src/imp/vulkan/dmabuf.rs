@@ -9,6 +9,7 @@ use ash::{
     },
 };
 
+#[allow(dead_code)]
 pub const REQUIRED_DEVICE_EXTENSIONS: &[&CStr] = &[
     /* VK_EXT_external_memory_dma_buf */
     ExtExternalMemoryDmaBufFn::name(),

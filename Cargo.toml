@@ -21,7 +21,9 @@ glow = "0.11.2"
 [dependencies.nix]
 version = "0.24.1"
 default-features = false
-features = []
+features = [
+    "fs",
+]
 
 [build-dependencies]
 cfg_aliases = "0.1.1"

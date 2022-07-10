@@ -1,5 +1,10 @@
-use std::{ffi::c_void, mem, os::raw::c_uint};
+use std::{
+    ffi::{c_void, CStr},
+    mem,
+    os::raw::{c_char, c_uint},
+};
 
+use nix::sys::stat::{major, minor, stat};
 use wgpu_core::api::Gles;
 use wgpu_hal::{Api, InstanceDescriptor};
 
@@ -7,6 +12,8 @@ use crate::adapter::{DeviceUuids, DrmInfo, UUID_LEN};
 
 pub const EGL_EXTENSIONS: i32 = 0x3055;
 pub const EGL_DEVICE_EXT: i32 = 0x322C;
+pub const EGL_DRM_DEVICE_FILE_EXT: i32 = 0x3233;
+pub const EGL_DRM_RENDER_NODE_FILE_EXT: i32 = 0x3377;
 
 pub const DEVICE_UUID_EXT: i32 = 0x9597;
 pub const DRIVER_UUID_EXT: i32 = 0x9598;
@@ -60,9 +67,51 @@ pub fn get_device_uuids(adapter: Option<&<Gles as Api>::Adapter>) -> Option<Devi
 
 pub fn get_drm_info(adapter: Option<&<Gles as Api>::Adapter>) -> Option<DrmInfo> {
     let adapter = adapter.unwrap();
-    let _egl_device = get_egl_device(adapter)?;
+    let egl_device = get_egl_device(adapter)?;
 
-    None // TODO
+    // Check the device extensions.
+    let device_extensions = unsafe { get_device_extensions(adapter, egl_device) }?;
+
+    if !device_extensions
+        .iter()
+        .any(|name| name == "EGL_EXT_device_drm")
+    {
+        return None;
+    }
+
+    let has_render = device_extensions
+        .iter()
+        .any(|name| name == "EGL_EXT_device_drm_render_node");
+
+    let primary_node_path =
+        unsafe { query_device_string(adapter, egl_device, EGL_DRM_DEVICE_FILE_EXT) }?;
+    let render_node_path = if has_render {
+        unsafe { query_device_string(adapter, egl_device, EGL_DRM_RENDER_NODE_FILE_EXT) }
+    } else {
+        None
+    };
+
+    let mut drm_info = DrmInfo {
+        primary_node: None,
+        render_node: None,
+    };
+
+    // stat the paths to get the major and minor numbers
+    if let Ok(stat) = stat(primary_node_path.as_str()) {
+        drm_info.primary_node = Some((major(stat.st_rdev), minor(stat.st_rdev)));
+    }
+
+    if let Some(render_node_path) = render_node_path {
+        if let Ok(stat) = stat(render_node_path.as_str()) {
+            drm_info.render_node = Some((major(stat.st_rdev), minor(stat.st_rdev)));
+        }
+    }
+
+    if drm_info.primary_node.is_none() && drm_info.primary_node.is_none() {
+        return None;
+    }
+
+    Some(drm_info)
 }
 
 fn get_egl_extensions(adapter: &<Gles as Api>::Adapter) -> Option<Vec<String>> {
@@ -92,6 +141,36 @@ fn get_display_extensions(adapter: &<Gles as Api>::Adapter) -> Option<Vec<String
             .map(|s| s.to_owned())
             .collect::<Vec<_>>(),
     )
+}
+
+unsafe fn get_device_extensions(
+    adapter: &<Gles as Api>::Adapter,
+    device: *mut c_void,
+) -> Option<Vec<String>> {
+    Some(
+        query_device_string(adapter, device, EGL_EXTENSIONS)?
+            .split_whitespace()
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>(),
+    )
+}
+
+unsafe fn query_device_string(
+    adapter: &<Gles as Api>::Adapter,
+    device: *mut c_void,
+    name: i32,
+) -> Option<String> {
+    let instance = adapter.adapter_context().egl_instance()?;
+    let query_device_string_ext = mem::transmute::<_, QueryDeviceStringEXT>(
+        instance.get_proc_address("eglQueryDeviceStringEXT")?,
+    );
+    let raw_extensions = query_device_string_ext(device, name);
+
+    if raw_extensions.is_null() {
+        return None;
+    }
+
+    Some(CStr::from_ptr(raw_extensions).to_str().unwrap().to_owned())
 }
 
 fn get_egl_device(adapter: &<Gles as Api>::Adapter) -> Option<*mut c_void> {
@@ -133,6 +212,11 @@ fn get_egl_device(adapter: &<Gles as Api>::Adapter) -> Option<*mut c_void> {
 
     None
 }
+
+type QueryDeviceStringEXT = unsafe extern "C" fn(
+    *mut c_void, // egl device
+    i32,         // name
+) -> *const c_char;
 
 type EglQueryDisplayAttribEXT = unsafe extern "C" fn(
     *mut c_void, // dpy

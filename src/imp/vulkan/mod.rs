@@ -292,7 +292,7 @@ unsafe fn get_physical_device_properties2(
 
 pub fn request_device(
     adapter: &Adapter,
-    desc: DeviceDescriptor,
+    desc: &DeviceDescriptor,
     trace_path: Option<&Path>,
 ) -> Result<(ExternalMemoryDevice, wgpu::Queue), RequestDeviceError> {
     let hal_device = unsafe {

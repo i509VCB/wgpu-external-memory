@@ -14,6 +14,7 @@ use crate::{
 #[derive(Debug)]
 pub enum DeviceInner {
     Vulkan(vulkan::Inner),
+    Egl,
 }
 
 impl AdapterExt for Adapter {
@@ -67,7 +68,7 @@ impl AdapterExt for Adapter {
 
     fn request_device_with_external_memory(
         &self,
-        desc: DeviceDescriptor,
+        desc: &DeviceDescriptor,
         trace_path: Option<&Path>,
     ) -> Result<(ExternalMemoryDevice, wgpu::Queue), RequestDeviceError> {
         #[cfg(vulkan)]
@@ -75,11 +76,18 @@ impl AdapterExt for Adapter {
             let is_vulkan = unsafe { self.as_hal::<Vulkan, _, bool>(|adapter| adapter.is_some()) };
 
             if is_vulkan {
-                return vulkan::request_device(self, desc, trace_path);
+                return vulkan::request_device(self, &desc, trace_path);
             }
         }
 
-        // TODO: EGL
+        #[cfg(egl)]
+        {
+            let is_gl = unsafe { self.as_hal::<Gles, _, bool>(|adapter| adapter.is_some()) };
+
+            if is_gl {
+                return egl::request_device(self, desc, trace_path);
+            }
+        }
 
         Err(RequestDeviceError)
     }

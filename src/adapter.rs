@@ -46,6 +46,9 @@ pub trait AdapterExt: Sized {
     /// This will return [`None`] if any of the required extensions are not available.
     fn drm_info(&self) -> Option<DrmInfo>;
 
+    /// Whether this adapter supports dmabuf external memory.
+    ///
+    /// This does not guarantee that both import and export operations are supported.
     fn supports_dmabuf_external_memory(&self) -> bool;
 
     /// Requests a connection to a physical device, creating a logical device.
@@ -61,7 +64,7 @@ pub trait AdapterExt: Sized {
     /// [`Adapter::request_device`]: wgpu::Adapter::request_device
     fn request_device_with_external_memory(
         &self,
-        desc: DeviceDescriptor,
+        desc: &DeviceDescriptor,
         trace_path: Option<&Path>,
     ) -> Result<(ExternalMemoryDevice, wgpu::Queue), RequestDeviceError>;
 }

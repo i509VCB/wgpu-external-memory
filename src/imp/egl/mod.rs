@@ -1,14 +1,18 @@
+// TODO:
+// - EGL is going to be limited to export only unless wgpu has changes to support https://www.khronos.org/registry/OpenGL/extensions/OES/OES_EGL_image_external.txt
+
 use std::{
     ffi::{c_void, CStr},
     mem,
-    os::raw::{c_char, c_uint},
+    os::raw::{c_char, c_uint}, path::Path,
 };
 
 use nix::sys::stat::{major, minor, stat};
+use wgpu::{Adapter, DeviceDescriptor, RequestDeviceError};
 use wgpu_core::api::Gles;
 use wgpu_hal::{Api, InstanceDescriptor};
 
-use crate::adapter::{DeviceUuids, DrmInfo, UUID_LEN};
+use crate::{adapter::{DeviceUuids, DrmInfo, UUID_LEN}, ExternalMemoryDevice};
 
 pub const EGL_EXTENSIONS: i32 = 0x3055;
 pub const EGL_DEVICE_EXT: i32 = 0x322C;
@@ -112,6 +116,30 @@ pub fn get_drm_info(adapter: Option<&<Gles as Api>::Adapter>) -> Option<DrmInfo>
     }
 
     Some(drm_info)
+}
+
+pub fn request_device(
+    adapter: &Adapter,
+    desc: &DeviceDescriptor,
+    trace_path: Option<&Path>,
+) -> Result<(ExternalMemoryDevice, wgpu::Queue), RequestDeviceError> {
+    // EGL doesn't need any additional setup, simply request a device.
+    let hal_device = unsafe {
+        adapter.as_hal::<Gles, _, _>(|adapter| {
+            let adapter = adapter.unwrap();
+            wgpu_hal::Adapter::open(adapter, desc.features, &desc.limits)
+        })
+    }.map_err(|_| RequestDeviceError)?;
+
+    let (device, queue) = unsafe { adapter.create_device_from_hal(hal_device, desc, trace_path) }?;
+
+    Ok((
+        ExternalMemoryDevice {
+            device,
+            inner: super::DeviceInner::Egl,
+        },
+        queue,
+    ))
 }
 
 fn get_egl_extensions(adapter: &<Gles as Api>::Adapter) -> Option<Vec<String>> {
